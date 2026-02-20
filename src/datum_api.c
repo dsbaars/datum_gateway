@@ -1608,6 +1608,306 @@ int datum_api_umbrel_widget(struct MHD_Connection * const connection) {
 }
 #endif
 
+static enum MHD_Result datum_api_json_response(struct MHD_Connection *connection, int status_code, json_t *root) {
+	char *body = json_dumps(root, JSON_COMPACT | JSON_REAL_PRECISION(8));
+	json_decref(root);
+	if (!body) {
+		body = strdup("{\"error\":\"Internal error\"}");
+		status_code = MHD_HTTP_INTERNAL_SERVER_ERROR;
+	}
+	if (!body) return MHD_NO;
+	size_t len = strlen(body);
+	struct MHD_Response *response = MHD_create_response_from_buffer(len, body, MHD_RESPMEM_MUST_FREE);
+	MHD_add_response_header(response, "Content-Type", "application/json");
+	enum MHD_Result ret = datum_api_submit_uncached_response(connection, (unsigned int)status_code, response);
+	return ret;
+}
+
+static enum MHD_Result datum_api_json_error(struct MHD_Connection *connection, int status_code, const char *message) {
+	json_t *j = json_object();
+	json_object_set_new(j, "error", json_string(message));
+	return datum_api_json_response(connection, status_code, j);
+}
+
+static void datum_api_json_connection_status(const T_DATUM_API_DASH_VARS *vardata, json_t *obj) {
+	const char *status = "unknown";
+	const char *bt_err = datum_blocktemplates_error;
+	if (bt_err) {
+		status = "error";
+		json_object_set_new(obj, "connection_error", json_string(bt_err));
+	} else if (!vardata->sjob) {
+		status = "initialising";
+	} else if (datum_protocol_is_active()) {
+		status = "ready";
+	} else if (datum_config.datum_pooled_mining_only && datum_config.datum_pool_host[0]) {
+		status = "not_ready";
+	} else {
+		status = "non_pooled";
+	}
+	json_object_set_new(obj, "connection_status", json_string(status));
+}
+
+static json_t *datum_api_json_job(const T_DATUM_STRATUM_JOB *sjob) {
+	json_t *job = json_object();
+	T_DATUM_TEMPLATE_DATA *bt = sjob->block_template;
+	json_object_set_new(job, "job_id", json_string(sjob->job_id));
+	json_object_set_new(job, "global_index", json_integer(sjob->global_index));
+	json_object_set_new(job, "created_ts_ms", json_integer((json_int_t)sjob->tsms));
+	json_object_set_new(job, "block_height", json_integer((json_int_t)bt->height));
+	json_object_set_new(job, "block_value_btc", json_real((double)bt->coinbasevalue / 100000000.0));
+	json_object_set_new(job, "previous_block_hash", json_string(bt->previousblockhash));
+	json_object_set_new(job, "block_target", json_string(bt->block_target_hex));
+	json_object_set_new(job, "witness_commitment", json_string(bt->default_witness_commitment));
+	json_object_set_new(job, "difficulty", json_real((double)calc_network_difficulty(sjob->nbits)));
+	json_object_set_new(job, "version", json_string(sjob->version));
+	json_object_set_new(job, "version_uint", json_integer((json_int_t)sjob->version_uint));
+	json_object_set_new(job, "bits", json_string(sjob->nbits));
+	json_object_set_new(job, "curtime", json_integer((json_int_t)bt->curtime));
+	json_object_set_new(job, "mintime", json_integer((json_int_t)bt->mintime));
+	json_object_set_new(job, "sizelimit", json_integer((json_int_t)bt->sizelimit));
+	json_object_set_new(job, "weightlimit", json_integer((json_int_t)bt->weightlimit));
+	json_object_set_new(job, "sigoplimit", json_integer((json_int_t)bt->sigoplimit));
+	json_object_set_new(job, "txn_total_size", json_integer((json_int_t)bt->txn_total_size));
+	json_object_set_new(job, "txn_total_weight", json_integer((json_int_t)bt->txn_total_weight));
+	json_object_set_new(job, "txn_total_sigops", json_integer((json_int_t)bt->txn_total_sigops));
+	json_object_set_new(job, "txn_count", json_integer((json_int_t)bt->txn_count));
+	return job;
+}
+
+static enum MHD_Result datum_api_json_status(struct MHD_Connection *connection) {
+	T_DATUM_API_DASH_VARS vardata;
+	memset(&vardata, 0, sizeof(vardata));
+	datum_api_dash_stats(&vardata);
+
+	json_t *root = json_object();
+	json_object_set_new(root, "shares_accepted", json_integer((json_int_t)datum_accepted_share_count));
+	json_object_set_new(root, "shares_accepted_diff", json_integer((json_int_t)datum_accepted_share_diff));
+	json_object_set_new(root, "shares_rejected", json_integer((json_int_t)datum_rejected_share_count));
+	json_object_set_new(root, "shares_rejected_diff", json_integer((json_int_t)datum_rejected_share_diff));
+	datum_api_json_connection_status(&vardata, root);
+
+	json_object_set_new(root, "pool_host", json_string(datum_config.datum_pool_host[0] ? datum_config.datum_pool_host : ""));
+	json_object_set_new(root, "pool_port", json_integer(datum_config.datum_pool_port));
+	json_object_set_new(root, "pool_tag", json_string(datum_protocol_is_active() ? datum_config.override_mining_coinbase_tag_primary : datum_config.mining_coinbase_tag_primary));
+	json_object_set_new(root, "miner_tag", json_string(datum_config.mining_coinbase_tag_secondary));
+	json_object_set_new(root, "pool_diff", json_integer((json_int_t)datum_config.override_vardiff_min));
+	json_object_set_new(root, "pool_pubkey", json_string(datum_config.datum_pool_pubkey));
+
+	uint64_t uptime = get_process_uptime_seconds();
+	json_t *uptime_obj = json_object();
+	json_object_set_new(uptime_obj, "days", json_integer((json_int_t)(uptime / (24 * 3600))));
+	json_object_set_new(uptime_obj, "hours", json_integer((json_int_t)((uptime % (24 * 3600)) / 3600)));
+	json_object_set_new(uptime_obj, "minutes", json_integer((json_int_t)((uptime % 3600) / 60)));
+	json_object_set_new(uptime_obj, "seconds", json_integer((json_int_t)(uptime % 60)));
+	json_object_set_new(root, "uptime", uptime_obj);
+
+	json_object_set_new(root, "active_threads", json_integer(vardata.STRATUM_ACTIVE_THREADS));
+	json_object_set_new(root, "total_connections", json_integer(vardata.STRATUM_TOTAL_CONNECTIONS));
+	json_object_set_new(root, "total_subscriptions", json_integer(vardata.STRATUM_TOTAL_SUBSCRIPTIONS));
+	json_object_set_new(root, "hashrate_estimate_th_s", json_real(vardata.STRATUM_HASHRATE_ESTIMATE));
+
+	if (vardata.sjob) {
+		json_object_set_new(root, "job", datum_api_json_job(vardata.sjob));
+	} else {
+		json_object_set_new(root, "job", json_null());
+	}
+	return datum_api_json_response(connection, MHD_HTTP_OK, root);
+}
+
+static enum MHD_Result datum_api_json_threads(struct MHD_Connection *connection) {
+	json_t *arr = json_array();
+	const int max_threads = global_stratum_app ? global_stratum_app->max_threads : 0;
+	uint64_t tsms = current_time_millis();
+
+	for (int j = 0; j < max_threads; j++) {
+		double thr = 0.0;
+		int subs = 0, conns = 0;
+		if (global_stratum_app) {
+			for (int ii = 0; ii < global_stratum_app->max_clients_thread; ii++) {
+				if (global_stratum_app->datum_threads[j].client_data[ii].fd > 0) {
+					conns++;
+					T_DATUM_MINER_DATA *m = (T_DATUM_MINER_DATA *)global_stratum_app->datum_threads[j].client_data[ii].app_client_data;
+					if (m && m->subscribed) {
+						subs++;
+						unsigned char astat = m->stats.active_index ? 0 : 1;
+						double hr = 0.0;
+						if ((m->stats.last_swap_ms > 0) && (m->stats.diff_accepted[astat] > 0)) {
+							hr = ((double)m->stats.diff_accepted[astat] / (double)((double)m->stats.last_swap_ms / 1000.0)) * 0.004294967296;
+						}
+						if (((double)(tsms - m->stats.last_swap_tsms) / 1000.0) < 180.0) thr += hr;
+					}
+				}
+			}
+		}
+		if (conns > 0) {
+			json_t *obj = json_object();
+			json_object_set_new(obj, "tid", json_integer(j));
+			json_object_set_new(obj, "connection_count", json_integer(conns));
+			json_object_set_new(obj, "sub_count", json_integer(subs));
+			json_object_set_new(obj, "hashrate_estimate_th_s", json_real(thr));
+			json_array_append_new(arr, obj);
+		}
+	}
+	json_t *root = json_object();
+	json_object_set_new(root, "threads", arr);
+	return datum_api_json_response(connection, MHD_HTTP_OK, root);
+}
+
+static enum MHD_Result datum_api_json_clients(struct MHD_Connection *connection) {
+	if (!datum_config.api_admin_password_len) {
+		return datum_api_json_error(connection, MHD_HTTP_FORBIDDEN, "Admin access required");
+	}
+	if (!datum_api_check_admin_password_httponly(connection, datum_api_create_response_authfail_clients)) {
+		return datum_api_json_error(connection, MHD_HTTP_UNAUTHORIZED, "Unauthorized");
+	}
+	json_t *arr = json_array();
+	const int max_threads = global_stratum_app ? global_stratum_app->max_threads : 0;
+	uint64_t tsms = current_time_millis();
+
+	for (int j = 0; j < max_threads; j++) {
+		for (int ii = 0; ii < global_stratum_app->max_clients_thread; ii++) {
+			if (global_stratum_app->datum_threads[j].client_data[ii].fd <= 0) continue;
+			T_DATUM_MINER_DATA *m = (T_DATUM_MINER_DATA *)global_stratum_app->datum_threads[j].client_data[ii].app_client_data;
+			if (!m) continue;
+			json_t *obj = json_object();
+			json_object_set_new(obj, "tid", json_integer(j));
+			json_object_set_new(obj, "cid", json_integer(ii));
+			json_object_set_new(obj, "rem_host", json_string(global_stratum_app->datum_threads[j].client_data[ii].rem_host));
+			json_object_set_new(obj, "auth_username", json_string(m->last_auth_username));
+			json_object_set_new(obj, "subscribed", json_boolean(m->subscribed));
+			if (m->subscribed) {
+				json_object_set_new(obj, "sid", json_integer(m->sid));
+				json_object_set_new(obj, "subscribe_age_seconds", json_real((double)(tsms - m->subscribe_tsms) / 1000.0));
+				json_object_set_new(obj, "last_accepted_ago_seconds", m->stats.last_share_tsms ? json_real((double)(tsms - m->stats.last_share_tsms) / 1000.0) : json_null());
+				json_object_set_new(obj, "current_diff", json_integer((json_int_t)m->current_diff));
+				json_object_set_new(obj, "share_diff_accepted", json_integer((json_int_t)m->share_diff_accepted));
+				json_object_set_new(obj, "share_count_accepted", json_integer((json_int_t)m->share_count_accepted));
+				json_object_set_new(obj, "share_diff_rejected", json_integer((json_int_t)m->share_diff_rejected));
+				json_object_set_new(obj, "share_count_rejected", json_integer((json_int_t)m->share_count_rejected));
+				double rj = 0.0;
+				if (m->share_diff_accepted > 0) {
+					rj = ((double)m->share_diff_rejected / (double)(m->share_diff_accepted + m->share_diff_rejected)) * 100.0;
+				}
+				json_object_set_new(obj, "reject_percent", json_real(rj));
+				unsigned char astat = m->stats.active_index ? 0 : 1;
+				double hr = 0.0;
+				if ((m->stats.last_swap_ms > 0) && (m->stats.diff_accepted[astat] > 0)) {
+					hr = ((double)m->stats.diff_accepted[astat] / (double)((double)m->stats.last_swap_ms / 1000.0)) * 0.004294967296;
+				}
+				json_object_set_new(obj, "hashrate_th_s", json_real(hr));
+				json_object_set_new(obj, "hashrate_age_seconds", json_real((double)(tsms - m->stats.last_swap_tsms) / 1000.0));
+				json_object_set_new(obj, "coinbase_type", json_string(m->coinbase_selection < (int)(sizeof(cbnames) / sizeof(cbnames[0])) ? cbnames[m->coinbase_selection] : "Unknown"));
+			}
+			json_object_set_new(obj, "useragent", json_string(m->useragent));
+			json_object_set_new(obj, "connect_tsms", json_integer((json_int_t)m->connect_tsms));
+			json_object_set_new(obj, "unique_id", json_integer((json_int_t)m->unique_id));
+			json_array_append_new(arr, obj);
+		}
+	}
+	json_t *root = json_object();
+	json_object_set_new(root, "clients", arr);
+	return datum_api_json_response(connection, MHD_HTTP_OK, root);
+}
+
+static enum MHD_Result datum_api_json_coinbaser(struct MHD_Connection *connection) {
+	T_DATUM_STRATUM_JOB *sjob = NULL;
+	int j;
+	pthread_rwlock_rdlock(&stratum_global_job_ptr_lock);
+	j = global_latest_stratum_job_index;
+	sjob = (j >= 0 && j < MAX_STRATUM_JOBS) ? global_cur_stratum_jobs[j] : NULL;
+	pthread_rwlock_unlock(&stratum_global_job_ptr_lock);
+
+	json_t *outputs = json_array();
+	uint64_t total_sats = 0;
+	char tempaddr[256];
+	if (sjob) {
+		for (int i = 0; i < sjob->available_coinbase_outputs_count; i++) {
+			output_script_2_addr(sjob->available_coinbase_outputs[i].output_script, sjob->available_coinbase_outputs[i].output_script_len, tempaddr);
+			json_t *out = json_object();
+			json_object_set_new(out, "value_btc", json_real((double)sjob->available_coinbase_outputs[i].value_sats / 100000000.0));
+			json_object_set_new(out, "address", json_string(tempaddr));
+			json_array_append_new(outputs, out);
+			total_sats += sjob->available_coinbase_outputs[i].value_sats;
+		}
+		if (total_sats < sjob->coinbase_value) {
+			output_script_2_addr(sjob->pool_addr_script, sjob->pool_addr_script_len, tempaddr);
+			json_t *out = json_object();
+			json_object_set_new(out, "value_btc", json_real((double)(sjob->coinbase_value - total_sats) / 100000000.0));
+			json_object_set_new(out, "address", json_string(tempaddr));
+			json_array_append_new(outputs, out);
+			total_sats = sjob->coinbase_value;
+		}
+	}
+	json_t *root = json_object();
+	json_object_set_new(root, "outputs", outputs);
+	json_object_set_new(root, "total_value_btc", sjob ? json_real((double)total_sats / 100000000.0) : json_null());
+	return datum_api_json_response(connection, MHD_HTTP_OK, root);
+}
+
+static enum MHD_Result datum_api_json_config(struct MHD_Connection *connection) {
+	json_t *root = json_object();
+	json_t *bitcoind = json_object();
+	json_object_set_new(bitcoind, "rpcurl", json_string(datum_config.bitcoind_rpcurl));
+	json_object_set_new(bitcoind, "rpcuser", json_string(datum_config.bitcoind_rpcuser));
+	json_object_set_new(bitcoind, "work_update_seconds", json_integer(datum_config.bitcoind_work_update_seconds));
+	json_object_set_new(bitcoind, "notify_fallback", json_boolean(datum_config.bitcoind_notify_fallback));
+	json_object_set_new(root, "bitcoind", bitcoind);
+
+	json_t *stratum = json_object();
+	json_object_set_new(stratum, "listen_addr", json_string(datum_config.stratum_v1_listen_addr));
+	json_object_set_new(stratum, "listen_port", json_integer(datum_config.stratum_v1_listen_port));
+	json_object_set_new(stratum, "max_clients", json_integer(datum_config.stratum_v1_max_clients));
+	json_object_set_new(stratum, "max_threads", json_integer(datum_config.stratum_v1_max_threads));
+	json_object_set_new(stratum, "max_clients_per_thread", json_integer(datum_config.stratum_v1_max_clients_per_thread));
+	json_object_set_new(stratum, "trust_proxy", json_integer(datum_config.stratum_v1_trust_proxy));
+	json_object_set_new(stratum, "vardiff_min", json_integer(datum_config.stratum_v1_vardiff_min));
+	json_object_set_new(stratum, "vardiff_target_shares_min", json_integer(datum_config.stratum_v1_vardiff_target_shares_min));
+	json_object_set_new(stratum, "share_stale_seconds", json_integer(datum_config.stratum_v1_share_stale_seconds));
+	json_object_set_new(stratum, "fingerprint_miners", json_boolean(datum_config.stratum_v1_fingerprint_miners));
+	json_object_set_new(stratum, "idle_timeout_no_subscribe", json_integer(datum_config.stratum_v1_idle_timeout_no_subscribe));
+	json_object_set_new(stratum, "idle_timeout_no_share", json_integer(datum_config.stratum_v1_idle_timeout_no_share));
+	json_object_set_new(stratum, "idle_timeout_max_last_work", json_integer(datum_config.stratum_v1_idle_timeout_max_last_work));
+	json_object_set_new(root, "stratum_v1", stratum);
+
+	json_t *mining = json_object();
+	json_object_set_new(mining, "pool_address", json_string(datum_config.mining_pool_address));
+	json_object_set_new(mining, "coinbase_tag_primary", json_string(datum_config.mining_coinbase_tag_primary));
+	json_object_set_new(mining, "coinbase_tag_secondary", json_string(datum_config.mining_coinbase_tag_secondary));
+	json_object_set_new(mining, "save_submitblocks_dir", json_string(datum_config.mining_save_submitblocks_dir));
+	json_object_set_new(mining, "coinbase_unique_id", json_integer(datum_config.coinbase_unique_id));
+	json_object_set_new(root, "mining", mining);
+
+	json_t *api = json_object();
+	json_object_set_new(api, "listen_addr", json_string(datum_config.api_listen_addr));
+	json_object_set_new(api, "listen_port", json_integer(datum_config.api_listen_port));
+	json_object_set_new(api, "allow_insecure_auth", json_boolean(datum_config.api_allow_insecure_auth));
+	json_object_set_new(api, "modify_conf", json_boolean(datum_config.api_modify_conf));
+	json_object_set_new(root, "api", api);
+
+	json_t *datum = json_object();
+	json_object_set_new(datum, "pool_host", json_string(datum_config.datum_pool_host));
+	json_object_set_new(datum, "pool_port", json_integer(datum_config.datum_pool_port));
+	json_object_set_new(datum, "pool_pass_workers", json_boolean(datum_config.datum_pool_pass_workers));
+	json_object_set_new(datum, "pool_pass_full_users", json_boolean(datum_config.datum_pool_pass_full_users));
+	json_object_set_new(datum, "always_pay_self", json_boolean(datum_config.datum_always_pay_self));
+	json_object_set_new(datum, "pooled_mining_only", json_boolean(datum_config.datum_pooled_mining_only));
+	json_object_set_new(datum, "pool_pubkey", json_string(datum_config.datum_pool_pubkey));
+	json_object_set_new(datum, "protocol_global_timeout", json_integer(datum_config.datum_protocol_global_timeout));
+	json_object_set_new(root, "datum", datum);
+
+	json_t *clog = json_object();
+	json_object_set_new(clog, "to_file", json_boolean(datum_config.clog_to_file));
+	json_object_set_new(clog, "to_console", json_boolean(datum_config.clog_to_console));
+	json_object_set_new(clog, "level_console", json_integer(datum_config.clog_level_console));
+	json_object_set_new(clog, "level_file", json_integer(datum_config.clog_level_file));
+	json_object_set_new(clog, "calling_function", json_boolean(datum_config.clog_calling_function));
+	json_object_set_new(clog, "to_stderr", json_boolean(datum_config.clog_to_stderr));
+	json_object_set_new(clog, "rotate_daily", json_boolean(datum_config.clog_rotate_daily));
+	json_object_set_new(clog, "file", json_string(datum_config.clog_file));
+	json_object_set_new(root, "clog", clog);
+	return datum_api_json_response(connection, MHD_HTTP_OK, root);
+}
+
 int datum_api_testnet_fastforward(struct MHD_Connection * const connection) {
 	const char *time_str;
 	
@@ -1736,6 +2036,15 @@ enum MHD_Result datum_api_answer(void *cls, struct MHD_Connection *connection, c
 	if (int_method == 1 && url[0] == '/' && url[1] == 0) {
 		// homepage
 		return datum_api_homepage(connection);
+	}
+
+	if (int_method == 1 && strncmp(url, "/api/v1/", 8) == 0) {
+		const char *path = url + 8;
+		if (strcmp(path, "status") == 0) return datum_api_json_status(connection);
+		if (strcmp(path, "threads") == 0) return datum_api_json_threads(connection);
+		if (strcmp(path, "clients") == 0) return datum_api_json_clients(connection);
+		if (strcmp(path, "coinbaser") == 0) return datum_api_json_coinbaser(connection);
+		if (strcmp(path, "config") == 0) return datum_api_json_config(connection);
 	}
 	
 	switch (url[1]) {
