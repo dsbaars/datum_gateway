@@ -522,6 +522,13 @@ static struct MHD_Response *datum_api_create_response_authfail(const char * cons
 	return response;
 }
 
+static struct MHD_Response *datum_api_create_response_authfail_json(void) {
+	static const char body[] = "{\"error\":\"Unauthorized\"}";
+	struct MHD_Response *r = MHD_create_response_from_buffer(sizeof(body) - 1, (void *)body, MHD_RESPMEM_PERSISTENT);
+	MHD_add_response_header(r, "Content-Type", "application/json");
+	return r;
+}
+
 static struct MHD_Response *datum_api_create_response_authfail_clients() {
 	return datum_api_create_response_authfail(www_clients_top_html, www_clients_top_html_sz);
 }
@@ -1757,8 +1764,9 @@ static enum MHD_Result datum_api_json_clients(struct MHD_Connection *connection)
 	if (!datum_config.api_admin_password_len) {
 		return datum_api_json_error(connection, MHD_HTTP_FORBIDDEN, "Admin access required");
 	}
-	if (!datum_api_check_admin_password_httponly(connection, datum_api_create_response_authfail_clients)) {
-		return datum_api_json_error(connection, MHD_HTTP_UNAUTHORIZED, "Unauthorized");
+	/* Auth failure already queues a 401 (with JSON body) — do not queue a second response */
+	if (!datum_api_check_admin_password_httponly(connection, datum_api_create_response_authfail_json)) {
+		return MHD_YES;
 	}
 	json_t *arr = json_array();
 	const int max_threads = global_stratum_app ? global_stratum_app->max_threads : 0;
